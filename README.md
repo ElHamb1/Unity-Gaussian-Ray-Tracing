@@ -8,6 +8,15 @@ The package includes tools to import existing Gaussian PLY models, bake semantic
 
 Package: `com.markus.gaussian-raytracing` version `0.1.0`.
 
+## Demo
+
+https://github.com/user-attachments/assets/7d90bd6d-1e21-4c1b-8711-3cf37f3f9413
+Demo: Gaussian ray tracing in Unity HDRP with dynamic shadows, dynamic light and transparent meshes.
+
+**Model credit:** [“3D gaussian model of a bouquet of flowers”](https://developer.download.nvidia.com/ProGraphics/nvpro-samples/flowers_1.zip)
+by [Jean-Eudes Marvie](https://jmarvie.com), distributed via NVIDIA.
+Listed by NVIDIA under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
+
 ## Requirements and status
 
 Target configuration: **Unity 6000.3.12f1, HDRP 17.3.0, Windows x64, Direct3D 12 and a hardware ray-tracing-capable GPU**.
