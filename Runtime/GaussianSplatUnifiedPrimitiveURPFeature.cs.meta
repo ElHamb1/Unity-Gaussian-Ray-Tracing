@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 3bd77a3e9aa7481c8ad3fb90d1783004
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences:
+  - m_PrimitiveCompute: {fileID: 7200000, guid: d33b4fb1fa004fb4949b4645055ecd11, type: 3}
+  - m_DrawShader: {fileID: 4800000, guid: 59156faab7a2467790afd2a4c38e1679, type: 3}
+  - m_CompositeShader: {fileID: 4800000, guid: 5be6030af0cc4c499e18a3045a34138c, type: 3}
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 

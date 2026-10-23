@@ -1,0 +1,33 @@
+{
+  "name": "com.markus.gaussian-raytracing",
+  "version": "0.1.0",
+  "displayName": "Gaussian Ray Tracing for HDRP",
+  "description": "Hardware ray tracing of layered 3D Gaussians and registered transmission meshes in HDRP. Includes import tools, setup diagnostics and a synthetic hybrid sample. Derived from UnityGaussianSplatting, the multi-layer anatomy renderer and NVIDIA vk_gaussian_splatting.",
+  "unity": "6000.3",
+  "unityRelease": "12f1",
+  "author": {
+    "name": "Markus"
+  },
+  "license": "See LICENSE.md",
+  "keywords": [
+    "gaussian",
+    "raytracing",
+    "hdrp",
+    "3dgrt",
+    "transmission"
+  ],
+  "dependencies": {
+    "com.unity.render-pipelines.high-definition": "17.3.0",
+    "com.unity.render-pipelines.core": "17.3.0",
+    "com.unity.burst": "1.8.28",
+    "com.unity.collections": "2.6.5",
+    "com.unity.mathematics": "1.3.3"
+  },
+  "samples": [
+    {
+      "displayName": "Basic Hybrid Scene",
+      "description": "Synthetic Gaussians, opaque receiver, glass and a moving occluder under one point light. After import: Tools > Gaussian Ray Tracing > Samples > Create Basic Hybrid Scene.",
+      "path": "Samples~/BasicHybridScene"
+    }
+  ]
+}

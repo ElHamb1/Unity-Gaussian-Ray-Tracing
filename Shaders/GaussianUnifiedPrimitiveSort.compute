@@ -1,0 +1,135 @@
+// SPDX-License-Identifier: MIT
+
+#define GROUP_SIZE 256
+
+#pragma kernel CSBuildUnifiedPrimitiveSortData
+
+// DeviceRadixSort kernels used by Runtime/GpuSorting.cs.
+#pragma kernel InitDeviceRadixSort
+#pragma kernel Upsweep
+#pragma kernel Scan
+#pragma kernel Downsweep
+
+#pragma exclude_renderers vulkan
+#pragma use_dxc
+
+#include "DeviceRadixSort.hlsl"
+#include "GaussianSplatting.hlsl"
+
+RWStructuredBuffer<uint> _UnifiedSortKeys;
+RWStructuredBuffer<uint> _UnifiedSortValues;
+
+StructuredBuffer<SplatViewData> _SplatViewData;
+
+struct UnifiedMeshVertex
+{
+    float3 position;
+    float3 normal;
+    float2 uv;
+};
+
+struct UnifiedMeshPrim
+{
+    uint index0;
+    uint index1;
+    uint index2;
+    uint meshIndex;
+};
+
+struct UnifiedMeshInstance
+{
+    float4 objectToWorld0;
+    float4 objectToWorld1;
+    float4 objectToWorld2;
+    float4 objectToWorld3;
+    float4 worldToObject0;
+    float4 worldToObject1;
+    float4 worldToObject2;
+    float4 worldToObject3;
+    float4 baseColor;
+    float4 baseMapST;
+    float4 faceOutsideColor;
+    float4 faceInsideColor;
+    float4 faceColorParams;
+};
+
+StructuredBuffer<UnifiedMeshVertex> _UnifiedMeshVertices;
+StructuredBuffer<UnifiedMeshPrim> _UnifiedMeshPrims;
+StructuredBuffer<UnifiedMeshInstance> _UnifiedMeshInstances;
+
+uint _UnifiedPrimitiveCount;
+uint _UnifiedSplatCount;
+uint _UnifiedMeshPrimCount;
+uint _UnifiedMeshDepthMode;
+float4x4 _UnifiedMatrixVP;
+
+#define UNIFIED_PRIMITIVE_MESH_BIT 0x80000000u
+#define UNIFIED_SORT_FAR_DEPTH 3.402823466e+38f
+
+// Radix-sort friendly float ordering, same idea as SplatUtilities_DeviceRadixSort.compute.
+uint FloatToSortableUintUnified(float f)
+{
+    uint fu = asuint(f);
+    uint mask = -((int)(fu >> 31)) | 0x80000000u;
+    return fu ^ mask;
+}
+
+float4 TransformUnifiedMeshPoint(UnifiedMeshInstance instanceData, float3 localPosition)
+{
+    return instanceData.objectToWorld0 * localPosition.x +
+        instanceData.objectToWorld1 * localPosition.y +
+        instanceData.objectToWorld2 * localPosition.z +
+        instanceData.objectToWorld3;
+}
+
+float ResolveMeshDepth(float d0, float d1, float d2)
+{
+    if (_UnifiedMeshDepthMode == 1)
+        return min(d0, min(d1, d2));
+    if (_UnifiedMeshDepthMode == 2)
+        return max(d0, max(d1, d2));
+    return (d0 + d1 + d2) * (1.0 / 3.0);
+}
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void CSBuildUnifiedPrimitiveSortData(uint3 id : SV_DispatchThreadID)
+{
+    uint primitiveIndex = id.x;
+    if (primitiveIndex >= _UnifiedPrimitiveCount)
+        return;
+
+    uint payload = primitiveIndex;
+    float depth = UNIFIED_SORT_FAR_DEPTH;
+
+    if (primitiveIndex < _UnifiedSplatCount)
+    {
+        SplatViewData view = _SplatViewData[primitiveIndex];
+        if (view.pos.w > 0.0)
+            depth = view.pos.w;
+    }
+    else
+    {
+        uint meshPrimIndex = primitiveIndex - _UnifiedSplatCount;
+        payload = UNIFIED_PRIMITIVE_MESH_BIT | meshPrimIndex;
+
+        if (meshPrimIndex < _UnifiedMeshPrimCount)
+        {
+            UnifiedMeshPrim meshPrim = _UnifiedMeshPrims[meshPrimIndex];
+            UnifiedMeshInstance instanceData = _UnifiedMeshInstances[meshPrim.meshIndex];
+
+            float4 w0 = TransformUnifiedMeshPoint(instanceData, _UnifiedMeshVertices[meshPrim.index0].position);
+            float4 w1 = TransformUnifiedMeshPoint(instanceData, _UnifiedMeshVertices[meshPrim.index1].position);
+            float4 w2 = TransformUnifiedMeshPoint(instanceData, _UnifiedMeshVertices[meshPrim.index2].position);
+
+            float4 c0 = mul(_UnifiedMatrixVP, w0);
+            float4 c1 = mul(_UnifiedMatrixVP, w1);
+            float4 c2 = mul(_UnifiedMatrixVP, w2);
+
+            if (c0.w > 0.0 || c1.w > 0.0 || c2.w > 0.0)
+                depth = ResolveMeshDepth(max(c0.w, 0.0), max(c1.w, 0.0), max(c2.w, 0.0));
+        }
+    }
+
+    _UnifiedSortKeys[primitiveIndex] = FloatToSortableUintUnified(depth);
+    _UnifiedSortValues[primitiveIndex] = payload;
+}

@@ -1,0 +1,13 @@
+{
+  "name": "GaussianRayTracing.BasicHybridSample.Editor",
+  "rootNamespace": "GaussianSplatting.Samples.Editor",
+  "references": [
+    "GaussianRayTracing.BasicHybridSample",
+    "GaussianSplatting",
+    "GaussianSplattingEditor",
+    "Unity.RenderPipelines.Core.Runtime",
+    "Unity.RenderPipelines.HighDefinition.Runtime"
+  ],
+  "includePlatforms": ["Editor"],
+  "autoReferenced": true
+}

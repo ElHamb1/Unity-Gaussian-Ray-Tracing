@@ -1,0 +1,1486 @@
+/*
+ * The segmented mesh/particle tracing and sorted any-hit integration in this
+ * file are based on nvpro-samples/vk_gaussian_splatting.
+ *
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION. All rights reserved.
+ * Licensed under the Apache License, Version 2.0.
+ * Unity/HDRP adaptation: Gaussian Ray Tracing for HDRP contributors.
+ * Modified for Unity resource bindings, procedural/triangle hit integration,
+ * layered/semantic data and custom lighting/shadow support. Packaged 2026-10-09.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#pragma max_recursion_depth 1
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/CommonLighting.hlsl"
+#include "Gaussian3DGRTCommon.hlsl"
+
+#define GAUSSIAN_3DGRT_MAX_MESH_BOUNCES 16
+#define GAUSSIAN_3DGRT_SHADOW_PASSES 2
+#define GAUSSIAN_3DGRT_MAX_LIGHTS 8
+#define GAUSSIAN_3DGRT_LIGHT_DIRECTIONAL 0u
+#define GAUSSIAN_3DGRT_LIGHT_POINT 1u
+#define GAUSSIAN_3DGRT_LIGHT_SPOT 2u
+#define GAUSSIAN_3DGRT_SEED_PIXEL_FRAME 0xD1B54A35u
+#define GAUSSIAN_3DGRT_SEED_PRIMARY_SEGMENT 0x94D049BBu
+#define GAUSSIAN_3DGRT_SEED_SECONDARY_SEGMENT 0x369DEA0Fu
+#define GAUSSIAN_3DGRT_SEED_GAUSSIAN_TRACE 0xA511E9B3u
+#define GAUSSIAN_3DGRT_SEED_GAUSSIAN_SHADE 0x63D83595u
+#define GAUSSIAN_3DGRT_SEED_MESH_SHADE 0xC2B2AE3Du
+#define GAUSSIAN_3DGRT_SEED_GAUSSIAN_SURFACE_SHADOW 0x27D4EB2Fu
+#define GAUSSIAN_3DGRT_SEED_MESH_SURFACE_SHADOW 0x165667B1u
+
+RaytracingAccelerationStructure _GaussianRTAS;
+RWTexture2D<float4> _Gaussian3DGRTOutput;
+Texture2DArray<float> _GaussianCameraDepth;
+Texture2DArray<float4> _GaussianCameraColor;
+
+float3 _GaussianCameraPosition;
+float3 _GaussianCameraRelativeOffset;
+float4x4 _GaussianInvViewProj;
+float4x4 _GaussianViewProj;
+int _GaussianCameraIsOrthographic;
+int _Gaussian3DGRTLightCount;
+float4 _Gaussian3DGRTLightPositionType[GAUSSIAN_3DGRT_MAX_LIGHTS];
+float4 _Gaussian3DGRTLightDirectionRange[GAUSSIAN_3DGRT_MAX_LIGHTS];
+float4 _Gaussian3DGRTLightColorAngleScale[GAUSSIAN_3DGRT_MAX_LIGHTS];
+float4 _Gaussian3DGRTLightAttenuation[GAUSSIAN_3DGRT_MAX_LIGHTS];
+float3 _Gaussian3DGRTAmbientColor;
+float _Gaussian3DGRTMaxRayDistance;
+float _Gaussian3DGRTBackgroundProjectionDistance;
+float _Gaussian3DGRTMinTransmittance;
+int _Gaussian3DGRTMaxTracePasses;
+float _Gaussian3DGRTSurfaceTransmittance;
+float _Gaussian3DGRTGaussianEmissiveStrength;
+float _Gaussian3DGRTGaussianRoughness;
+float _Gaussian3DGRTGaussianMetallic;
+float _Gaussian3DGRTGaussianIor;
+float _Gaussian3DGRTGaussianShadowBias;
+float _Gaussian3DGRTGaussianShadowStrength;
+int _Gaussian3DGRTHasTransmissionMeshes;
+int _Gaussian3DGRTHasShadowOnlyMeshes;
+int _Gaussian3DGRTTraceStrategy;
+int _Gaussian3DGRTStochasticShadows;
+int _Gaussian3DGRTFrameSampleId;
+
+float Gaussian3DGRTMaxComponent(float3 value)
+{
+    return max(value.x, max(value.y, value.z));
+}
+
+struct Gaussian3DGRTSurface
+{
+    float3 baseRadiance;
+    float transmittance;
+    float3 weightedNormal;
+    float weightSum;
+    float weightedDistance;
+    float surfaceDistance;
+    uint hitCount;
+};
+
+struct Gaussian3DGRTLightSample
+{
+    float3 direction;
+    float3 color;
+    float distance;
+    uint type;
+};
+
+bool Gaussian3DGRTUsesStochasticSampling()
+{
+    return
+        _Gaussian3DGRTTraceStrategy ==
+            GAUSSIAN_3DGRT_TRACE_STRATEGY_STOCHASTIC_ANY_HIT ||
+        _Gaussian3DGRTStochasticShadows != 0;
+}
+
+uint Gaussian3DGRTPixelFrameSeed(
+    uint2 pixel,
+    uint2 dimensions,
+    uint frameSampleId)
+{
+    uint seed = Gaussian3DRTHashCombine(
+        GAUSSIAN_3DGRT_SEED_PIXEL_FRAME, pixel.x);
+    seed = Gaussian3DRTHashCombine(seed, pixel.y);
+    seed = Gaussian3DRTHashCombine(seed, dimensions.x);
+    seed = Gaussian3DRTHashCombine(seed, dimensions.y);
+    return Gaussian3DRTHashCombine(seed, frameSampleId);
+}
+
+// Per-material light exclusion, carried in meshPadding[1] by whichever
+// closest-hit shader was struck.
+//
+// The mask says which lights to *drop*, not which to keep, so the payload's
+// zero initialization means "exclude nothing" and a shader that knows nothing
+// about this feature keeps its existing lighting for free.
+//
+// Bits are indexed by the light's authored slot - its position in the pass's
+// Primary + Additional list, published in the attenuation vector's w - and not
+// by lightIndex here, because the CPU-side packing skips disabled and
+// unusable lights and would otherwise renumber everything after them.
+bool Gaussian3DGRTLightExcluded(uint lightIndex, uint excludeMask)
+{
+    if (excludeMask == 0)
+        return false;
+    uint slot = (uint)round(_Gaussian3DGRTLightAttenuation[lightIndex].w);
+    return slot < 32 && (excludeMask & (1u << slot)) != 0;
+}
+
+bool Gaussian3DGRTSampleLight(
+    uint lightIndex,
+    float3 hitPosition,
+    out Gaussian3DGRTLightSample sample)
+{
+    sample.direction = 0;
+    sample.color = 0;
+    sample.distance = 0;
+    sample.type = GAUSSIAN_3DGRT_LIGHT_DIRECTIONAL;
+
+    float4 positionAndType =
+        _Gaussian3DGRTLightPositionType[lightIndex];
+    float4 directionAndRange =
+        _Gaussian3DGRTLightDirectionRange[lightIndex];
+    float4 colorAndAngleScale =
+        _Gaussian3DGRTLightColorAngleScale[lightIndex];
+    float4 attenuationParameters =
+        _Gaussian3DGRTLightAttenuation[lightIndex];
+    uint lightType = (uint)round(positionAndType.w);
+
+    sample.type = lightType;
+    sample.color = colorAndAngleScale.rgb;
+    if (lightType == GAUSSIAN_3DGRT_LIGHT_DIRECTIONAL)
+    {
+        float directionLengthSquared = dot(
+            directionAndRange.xyz,
+            directionAndRange.xyz);
+        if (directionLengthSquared <= 1e-8)
+            return false;
+        sample.direction = directionAndRange.xyz *
+            rsqrt(directionLengthSquared);
+        sample.distance = _Gaussian3DGRTMaxRayDistance;
+        return Gaussian3DGRTMaxComponent(sample.color) > 0;
+    }
+
+    if (lightType != GAUSSIAN_3DGRT_LIGHT_POINT &&
+        lightType != GAUSSIAN_3DGRT_LIGHT_SPOT)
+        return false;
+
+    float3 toLight = positionAndType.xyz - hitPosition;
+    float distanceSquared = dot(toLight, toLight);
+    float range = directionAndRange.w;
+    if (distanceSquared <= 1e-8 ||
+        range <= 0 ||
+        distanceSquared >= range * range)
+        return false;
+
+    float lightDistance = sqrt(distanceSquared);
+    float reciprocalDistance = rcp(lightDistance);
+    sample.direction = toLight * reciprocalDistance;
+    sample.distance = lightDistance;
+    float distanceProjection = lightDistance * dot(
+        sample.direction,
+        directionAndRange.xyz);
+    float4 distances = float4(
+        lightDistance,
+        distanceSquared,
+        reciprocalDistance,
+        distanceProjection);
+    float attenuation = PunctualLightAttenuation(
+        distances,
+        attenuationParameters.x,
+        attenuationParameters.y,
+        colorAndAngleScale.w,
+        attenuationParameters.z);
+    sample.color *= attenuation;
+    return attenuation > 1e-6 &&
+           Gaussian3DGRTMaxComponent(sample.color) > 0;
+}
+
+void Gaussian3DGRTResetSurface(out Gaussian3DGRTSurface surface)
+{
+    surface.baseRadiance = 0;
+    surface.transmittance = 1;
+    surface.weightedNormal = 0;
+    surface.weightSum = 0;
+    surface.weightedDistance = 0;
+    surface.surfaceDistance = GAUSSIAN_3DGRT_INVALID_DISTANCE;
+    surface.hitCount = 0;
+}
+
+void Gaussian3DGRTResetMeshPayload(inout Gaussian3DGRTMeshPayload payload)
+{
+    payload.meshHit = 0;
+    payload.meshDistance = GAUSSIAN_3DGRT_INVALID_DISTANCE;
+    payload.meshNormal = 0;
+    payload.meshBaseColor = 1;
+    payload.meshEmission = 0;
+    payload.meshTransmission = 0;
+    payload.meshIor = 1;
+    payload.meshRoughness = 0;
+    payload.meshMetallic = 0;
+    payload.meshShadowStrength = 0;
+    payload.meshMaxBounces = 1;
+    payload.meshFrontFace = 1;
+    [unroll]
+    for (uint paddingIndex = 0; paddingIndex < 15; ++paddingIndex)
+        payload.meshPadding[paddingIndex] = 0;
+}
+
+[shader("miss")]
+void Gaussian3DGRTGaussianMiss(
+    inout Gaussian3DGRTGaussianPayload payload : SV_RayPayload)
+{
+}
+
+[shader("miss")]
+void Gaussian3DGRTMeshMiss(
+    inout Gaussian3DGRTMeshPayload payload : SV_RayPayload)
+{
+}
+
+void Gaussian3DGRTTraceClosestMeshWithMask(
+    RayDesc ray,
+    uint instanceMask,
+    inout Gaussian3DGRTMeshPayload payload)
+{
+    Gaussian3DGRTResetMeshPayload(payload);
+    TraceRay(
+        _GaussianRTAS,
+        0,
+        instanceMask,
+        0,
+        1,
+        1,
+        ray,
+        payload);
+}
+
+void Gaussian3DGRTTraceClosestMesh(
+    RayDesc ray,
+    inout Gaussian3DGRTMeshPayload payload)
+{
+    Gaussian3DGRTTraceClosestMeshWithMask(
+        ray,
+        GAUSSIAN_3DGRT_PRIMARY_MESH_MASK,
+        payload);
+}
+
+void Gaussian3DGRTTraceClosestPhysicalMesh(
+    RayDesc ray,
+    inout Gaussian3DGRTMeshPayload payload)
+{
+    Gaussian3DGRTTraceClosestMeshWithMask(
+        ray,
+        GAUSSIAN_3DGRT_MESH_MASK,
+        payload);
+}
+
+void Gaussian3DGRTTraceAllPassSegment(
+    RayDesc ray,
+    inout int remainingTracePasses,
+    out Gaussian3DGRTSurface surface)
+{
+    Gaussian3DGRTResetSurface(surface);
+
+    [loop]
+    while (remainingTracePasses > 0)
+    {
+        --remainingTracePasses;
+        Gaussian3DGRTGaussianPayload payload;
+        payload.hitCount = 0;
+
+        TraceRay(
+            _GaussianRTAS,
+            RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+            GAUSSIAN_3DGRT_GAUSSIAN_MASK,
+            0,
+            1,
+            0,
+            ray,
+            payload);
+
+        uint hitCount = min(
+            payload.hitCount, (uint)GAUSSIAN_3DGRT_HITS_PER_PASS);
+        if (hitCount == 0)
+            break;
+
+        [loop]
+        for (uint hit = 0; hit < hitCount; ++hit)
+        {
+            float3 hitRadiance;
+            float alpha;
+            Gaussian3DRTUnpackColorAlpha(
+                payload.hitColorRG[hit],
+                payload.hitColorBA[hit],
+                hitRadiance,
+                alpha);
+
+            float weight = surface.transmittance * alpha;
+            surface.baseRadiance += weight * hitRadiance;
+            surface.weightedNormal += weight *
+                Gaussian3DRTUnpackNormalOct(
+                    payload.hitNormalOct[hit]);
+            surface.weightSum += weight;
+            surface.weightedDistance +=
+                weight * payload.hitDistance[hit];
+            surface.transmittance *= 1.0 - alpha;
+            ++surface.hitCount;
+
+            if (surface.surfaceDistance ==
+                    GAUSSIAN_3DGRT_INVALID_DISTANCE &&
+                surface.transmittance <
+                    _Gaussian3DGRTSurfaceTransmittance)
+            {
+                surface.surfaceDistance =
+                    payload.hitDistance[hit];
+            }
+
+            if (surface.transmittance <=
+                _Gaussian3DGRTMinTransmittance)
+                break;
+        }
+
+        if (surface.transmittance <=
+                _Gaussian3DGRTMinTransmittance ||
+            hitCount < GAUSSIAN_3DGRT_HITS_PER_PASS)
+            break;
+
+        float lastDistance = payload.hitDistance[hitCount - 1];
+        if (lastDistance >= ray.TMax)
+            break;
+        ray.TMin = lastDistance;
+    }
+
+    // NVIDIA's deterministic path selects the first transmittance-threshold
+    // crossing. A stable weighted fallback keeps sparse, semi-transparent
+    // edge pixels visible in this non-temporal Unity implementation.
+    if (surface.surfaceDistance ==
+            GAUSSIAN_3DGRT_INVALID_DISTANCE &&
+        surface.weightSum > 1e-6)
+    {
+        surface.surfaceDistance =
+            surface.weightedDistance / surface.weightSum;
+    }
+}
+
+void Gaussian3DGRTTraceStochasticSegment(
+    RayDesc ray,
+    uint sampleSeed,
+    out Gaussian3DGRTSurface surface)
+{
+    Gaussian3DGRTResetSurface(surface);
+
+    Gaussian3DGRTGaussianPayload payload;
+    Gaussian3DRTInitializeStochasticPayload(payload, sampleSeed);
+    TraceRay(
+        _GaussianRTAS,
+        RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+        GAUSSIAN_3DGRT_GAUSSIAN_MASK,
+        0,
+        1,
+        0,
+        ray,
+        payload);
+
+    if (payload.hitDistance[0] >= GAUSSIAN_3DGRT_INVALID_DISTANCE)
+        return;
+
+    float alpha;
+    Gaussian3DRTUnpackColorAlpha(
+        payload.hitColorRG[0],
+        payload.hitColorBA[0],
+        surface.baseRadiance,
+        alpha);
+    surface.transmittance = 0;
+    surface.weightedNormal = Gaussian3DRTUnpackNormalOct(
+        payload.hitNormalOct[0]);
+    surface.weightSum = 1;
+    surface.weightedDistance = payload.hitDistance[0];
+    surface.surfaceDistance = payload.hitDistance[0];
+    surface.hitCount = 1;
+}
+
+void Gaussian3DGRTTraceSegment(
+    RayDesc ray,
+    inout int remainingTracePasses,
+    uint sampleSeed,
+    out Gaussian3DGRTSurface surface)
+{
+    if (_Gaussian3DGRTTraceStrategy ==
+        GAUSSIAN_3DGRT_TRACE_STRATEGY_STOCHASTIC_ANY_HIT)
+    {
+        if (remainingTracePasses <= 0)
+        {
+            Gaussian3DGRTResetSurface(surface);
+            return;
+        }
+
+        --remainingTracePasses;
+        Gaussian3DGRTTraceStochasticSegment(ray, sampleSeed, surface);
+        return;
+    }
+
+    Gaussian3DGRTTraceAllPassSegment(
+        ray,
+        remainingTracePasses,
+        surface);
+}
+
+float Gaussian3DGRTTraceGaussianShadow(
+    float3 origin,
+    float3 direction,
+    float maxDistance,
+    uint sampleSeed)
+{
+    // A zero Gaussian pass budget denotes a mesh-only acceleration structure.
+    // Mesh shadows are traced separately and must remain active.
+    if (_Gaussian3DGRTMaxTracePasses <= 0)
+        return 1;
+
+    RayDesc shadowRay;
+    shadowRay.Origin = origin;
+    shadowRay.Direction = direction;
+    shadowRay.TMin = 0;
+    shadowRay.TMax = min(
+        max(maxDistance, 1e-5),
+        _Gaussian3DGRTMaxRayDistance);
+
+    if (_Gaussian3DGRTStochasticShadows != 0)
+    {
+        Gaussian3DGRTGaussianPayload stochasticPayload;
+        Gaussian3DRTInitializeStochasticPayload(
+            stochasticPayload, sampleSeed);
+        TraceRay(
+            _GaussianRTAS,
+            RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+            GAUSSIAN_3DGRT_GAUSSIAN_MASK,
+            0,
+            1,
+            0,
+            shadowRay,
+            stochasticPayload);
+        return stochasticPayload.hitDistance[0] <
+            GAUSSIAN_3DGRT_INVALID_DISTANCE
+            ? 0.0
+            : 1.0;
+    }
+
+    float transmittance = 1;
+    [loop]
+    for (int pass = 0; pass < GAUSSIAN_3DGRT_SHADOW_PASSES; ++pass)
+    {
+        Gaussian3DGRTGaussianPayload payload;
+        payload.hitCount = 0;
+        TraceRay(
+            _GaussianRTAS,
+            RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+            GAUSSIAN_3DGRT_GAUSSIAN_MASK,
+            0,
+            1,
+            0,
+            shadowRay,
+            payload);
+
+        uint hitCount = min(
+            payload.hitCount, (uint)GAUSSIAN_3DGRT_HITS_PER_PASS);
+        [loop]
+        for (uint hit = 0; hit < hitCount; ++hit)
+        {
+            float3 unusedRadiance;
+            float alpha;
+            Gaussian3DRTUnpackColorAlpha(
+                payload.hitColorRG[hit],
+                payload.hitColorBA[hit],
+                unusedRadiance,
+                alpha);
+            transmittance *= 1.0 - alpha;
+        }
+
+        if (transmittance <= _Gaussian3DGRTMinTransmittance ||
+            hitCount < GAUSSIAN_3DGRT_HITS_PER_PASS)
+            break;
+
+        float lastDistance = payload.hitDistance[hitCount - 1];
+        if (lastDistance >= shadowRay.TMax)
+            break;
+        shadowRay.TMin = lastDistance;
+    }
+    return saturate(transmittance);
+}
+
+float3 Gaussian3DGRTTraceMeshShadow(
+    float3 origin,
+    float3 direction,
+    float maxDistance)
+{
+    if (_Gaussian3DGRTHasTransmissionMeshes == 0)
+        return 1;
+
+    RayDesc shadowRay;
+    shadowRay.Origin = origin;
+    shadowRay.Direction = direction;
+    shadowRay.TMin = 0;
+    shadowRay.TMax = min(
+        max(maxDistance, 1e-5),
+        _Gaussian3DGRTMaxRayDistance);
+
+    Gaussian3DGRTMeshPayload payload;
+    Gaussian3DGRTTraceClosestPhysicalMesh(shadowRay, payload);
+    if (payload.meshHit == 0)
+        return 1;
+
+    return saturate(
+        payload.meshTransmission *
+        (1.0 - saturate(payload.meshMetallic)) *
+        payload.meshBaseColor);
+}
+
+// Visibility of a light through the shadow-only occluders. These are proxies
+// for things the scene has no real geometry for - the instruments, rebuilt
+// from their masks and stereo depth - so they block light without ever being
+// seen by a camera ray or bending one.
+//
+// Traced separately from the physical meshes rather than folded into their
+// mask: the occluder decides per light whether it casts at all, and only its
+// own hit can say so. Folding it in would let a tool that does not cast for
+// this light hide a real mesh behind it that does. Only the nearest occluder
+// is consulted, which is exact while all of them share one material.
+float Gaussian3DGRTTraceToolShadow(
+    float3 origin,
+    float3 direction,
+    float maxDistance,
+    uint lightIndex)
+{
+    if (_Gaussian3DGRTHasShadowOnlyMeshes == 0)
+        return 1;
+
+    RayDesc shadowRay;
+    shadowRay.Origin = origin;
+    shadowRay.Direction = direction;
+    shadowRay.TMin = 0;
+    shadowRay.TMax = min(
+        max(maxDistance, 1e-5),
+        _Gaussian3DGRTMaxRayDistance);
+
+    Gaussian3DGRTMeshPayload payload;
+    Gaussian3DGRTTraceClosestMeshWithMask(
+        shadowRay,
+        GAUSSIAN_3DGRT_SHADOW_ONLY_MESH_MASK,
+        payload);
+    if (payload.meshHit == 0)
+        return 1;
+
+    // Authored slot, not lightIndex, for the reason given at
+    // Gaussian3DGRTLightExcluded.
+    uint slot = (uint)round(_Gaussian3DGRTLightAttenuation[lightIndex].w);
+    bool casts = slot < 32 && (payload.meshPadding[2] & (1u << slot)) != 0;
+    return casts ? saturate(payload.meshTransmission) : 1;
+}
+
+// How much tool shadow an Unlit Alpha surface shows. That path evaluates no
+// lighting, so there is no light to take away; instead each light's tool
+// visibility darkens the surface, weighted by the strength the material asked
+// for. Lights the material excludes are skipped, as they are when lit.
+float Gaussian3DGRTUnlitToolShadow(
+    Gaussian3DGRTMeshPayload payload,
+    float3 hitPosition)
+{
+    float strength = saturate(asfloat(payload.meshPadding[3]));
+    if (strength <= 0 || _Gaussian3DGRTHasShadowOnlyMeshes == 0)
+        return 1;
+
+    float visibility = 1;
+    uint lightCount = min(
+        (uint)max(_Gaussian3DGRTLightCount, 0),
+        (uint)GAUSSIAN_3DGRT_MAX_LIGHTS);
+    [loop]
+    for (uint lightIndex = 0; lightIndex < lightCount; ++lightIndex)
+    {
+        if (Gaussian3DGRTLightExcluded(lightIndex, payload.meshPadding[1]))
+            continue;
+
+        Gaussian3DGRTLightSample light =
+            (Gaussian3DGRTLightSample)0;
+        if (!Gaussian3DGRTSampleLight(lightIndex, hitPosition, light))
+            continue;
+
+        bool directional =
+            light.type == GAUSSIAN_3DGRT_LIGHT_DIRECTIONAL;
+        const float shadowBias = 0.001;
+        float shadowOffset = directional
+            ? shadowBias
+            : min(shadowBias, light.distance * 0.5);
+        float shadowDistance = directional
+            ? _Gaussian3DGRTMaxRayDistance
+            : max(light.distance - shadowOffset, 1e-5);
+        visibility *= Gaussian3DGRTTraceToolShadow(
+            hitPosition + light.direction * shadowOffset,
+            light.direction,
+            shadowDistance,
+            lightIndex);
+    }
+    return lerp(1.0, visibility, strength);
+}
+
+float Gaussian3DGRTFresnel(
+    float cosine,
+    float incidentIor,
+    float transmittedIor)
+{
+    float denominator = max(incidentIor + transmittedIor, 1e-5);
+    float f0 = (incidentIor - transmittedIor) / denominator;
+    f0 *= f0;
+    float oneMinusCosine = 1.0 - saturate(cosine);
+    return saturate(f0 + (1.0 - f0) *
+        oneMinusCosine * oneMinusCosine * oneMinusCosine *
+        oneMinusCosine * oneMinusCosine);
+}
+
+float3 Gaussian3DGRTFresnelSchlick(
+    float cosine,
+    float3 reflectanceAtNormal)
+{
+    float oneMinusCosine = 1.0 - saturate(cosine);
+    float factor =
+        oneMinusCosine * oneMinusCosine *
+        oneMinusCosine * oneMinusCosine *
+        oneMinusCosine;
+    return saturate(
+        reflectanceAtNormal +
+        (1.0 - reflectanceAtNormal) * factor);
+}
+
+float Gaussian3DGRTSrgbToLinear(float value)
+{
+    value = max(value, 0);
+    return value <= 0.04045
+        ? value / 12.92
+        : pow((value + 0.055) / 1.055, 2.4);
+}
+
+float3 Gaussian3DGRTSrgbToLinear(float3 value)
+{
+    return float3(
+        Gaussian3DGRTSrgbToLinear(value.x),
+        Gaussian3DGRTSrgbToLinear(value.y),
+        Gaussian3DGRTSrgbToLinear(value.z));
+}
+
+float3 Gaussian3DGRTShadeGaussian(
+    Gaussian3DGRTSurface surface,
+    float3 hitPosition,
+    float3 rayDirection,
+    uint sampleSeed)
+{
+    float opacity = saturate(1.0 - surface.transmittance);
+    if (surface.hitCount == 0 || opacity <= 1e-6)
+        return 0;
+
+    float3 normal = surface.weightedNormal;
+    if (dot(normal, normal) <= 0.04)
+        normal = -rayDirection;
+    normal = normalize(normal);
+    if (dot(normal, -rayDirection) < 0)
+        normal = -normal;
+
+    float3 viewDirection = normalize(-rayDirection);
+    float noV = saturate(dot(normal, viewDirection));
+    // Gaussian training radiance is display-referred and premultiplied by the
+    // integrated opacity. Convert the unpremultiplied color before using it as
+    // a PBR base color, then premultiply the shaded result below.
+    float3 albedo = Gaussian3DGRTSrgbToLinear(
+        surface.baseRadiance / max(opacity, 1e-5));
+
+    float roughness = clamp(
+        _Gaussian3DGRTGaussianRoughness,
+        0.025,
+        1.0);
+    float metallic = saturate(
+        _Gaussian3DGRTGaussianMetallic);
+    float ior = clamp(
+        _Gaussian3DGRTGaussianIor,
+        1.0,
+        2.5);
+    float f0Scalar =
+        (ior - 1.0) / max(ior + 1.0, 1e-5);
+    f0Scalar *= f0Scalar;
+    float3 f0 = lerp(
+        f0Scalar.xxx,
+        saturate(albedo),
+        metallic);
+
+    float3 direct = 0;
+    uint lightCount = min(
+        (uint)max(_Gaussian3DGRTLightCount, 0),
+        (uint)GAUSSIAN_3DGRT_MAX_LIGHTS);
+    [loop]
+    for (uint lightIndex = 0; lightIndex < lightCount; ++lightIndex)
+    {
+        Gaussian3DGRTLightSample light =
+            (Gaussian3DGRTLightSample)0;
+        if (!Gaussian3DGRTSampleLight(
+                lightIndex,
+                hitPosition,
+                light))
+            continue;
+
+        float3 lightDirection = light.direction;
+        float noL = saturate(dot(normal, lightDirection));
+        if (noL <= 0)
+            continue;
+
+        bool directional =
+            light.type == GAUSSIAN_3DGRT_LIGHT_DIRECTIONAL;
+        const float meshShadowBias = 0.001;
+        float meshShadowOffset = directional
+            ? meshShadowBias
+            : min(meshShadowBias, light.distance * 0.5);
+        float meshShadowDistance = directional
+            ? _Gaussian3DGRTMaxRayDistance
+            : max(light.distance - meshShadowOffset, 1e-5);
+        float3 meshTransmittance =
+            Gaussian3DGRTTraceMeshShadow(
+                hitPosition +
+                    lightDirection * meshShadowOffset,
+                lightDirection,
+                meshShadowDistance);
+
+        float gaussianTransmittance = 1;
+        if (Gaussian3DGRTMaxComponent(
+                meshTransmittance) > 0.001 &&
+            _Gaussian3DGRTGaussianShadowStrength > 0)
+        {
+            float particleShadowBias = max(
+                _Gaussian3DGRTGaussianShadowBias,
+                meshShadowBias);
+            float particleShadowOffset = directional
+                ? particleShadowBias
+                : min(particleShadowBias, light.distance * 0.1);
+            float particleShadowDistance = directional
+                ? _Gaussian3DGRTMaxRayDistance
+                : max(
+                    light.distance - particleShadowOffset,
+                    1e-5);
+            gaussianTransmittance =
+                Gaussian3DGRTTraceGaussianShadow(
+                    hitPosition +
+                        lightDirection * particleShadowOffset,
+                    lightDirection,
+                    particleShadowDistance,
+                    Gaussian3DRTHashCombine(
+                        Gaussian3DRTHashCombine(
+                            sampleSeed,
+                            GAUSSIAN_3DGRT_SEED_GAUSSIAN_SURFACE_SHADOW),
+                        lightIndex));
+        }
+
+        float toolVisibility = Gaussian3DGRTTraceToolShadow(
+            hitPosition + lightDirection * meshShadowOffset,
+            lightDirection,
+            meshShadowDistance,
+            lightIndex);
+        float3 lightVisibility =
+            meshTransmittance *
+            toolVisibility *
+            lerp(
+                1.0,
+                gaussianTransmittance,
+                saturate(
+                    _Gaussian3DGRTGaussianShadowStrength));
+
+        float3 halfVectorUnnormalized =
+            lightDirection + viewDirection;
+        float3 specular = 0;
+        float3 fresnel = f0;
+        if (dot(
+                halfVectorUnnormalized,
+                halfVectorUnnormalized) > 1e-8)
+        {
+            float3 halfVector = normalize(
+                halfVectorUnnormalized);
+            float noH = saturate(
+                dot(normal, halfVector));
+            float voH = saturate(
+                dot(viewDirection, halfVector));
+            float alpha = max(
+                roughness * roughness, 0.0025);
+            float alphaSquared = alpha * alpha;
+            float denominator =
+                noH * noH *
+                    (alphaSquared - 1.0) +
+                1.0;
+            float distribution =
+                alphaSquared /
+                max(
+                    PI * denominator * denominator,
+                    1e-5);
+            float geometryK =
+                (roughness + 1.0) *
+                (roughness + 1.0) * 0.125;
+            float geometryV =
+                noV / lerp(noV, 1.0, geometryK);
+            float geometryL =
+                noL / lerp(noL, 1.0, geometryK);
+            fresnel = Gaussian3DGRTFresnelSchlick(
+                voH, f0);
+            specular =
+                fresnel * distribution *
+                geometryV * geometryL /
+                max(4.0 * noV * noL, 1e-4);
+        }
+
+        float3 diffuse =
+            (1.0 - fresnel) *
+            (1.0 - metallic) *
+            albedo / PI;
+        direct +=
+            (diffuse + specular) *
+            noL *
+            light.color *
+            lightVisibility *
+            opacity;
+    }
+
+    float3 ambient =
+        albedo *
+        _Gaussian3DGRTAmbientColor *
+        opacity;
+    // Keep the learned SH contribution as unshadowed emission, as NVIDIA's
+    // material path does. Only newly evaluated direct light is shadowed.
+    float3 learnedRadiance =
+        Gaussian3DGRTSrgbToLinear(surface.baseRadiance) *
+        max(_Gaussian3DGRTGaussianEmissiveStrength, 0);
+    return learnedRadiance + direct + ambient;
+}
+
+float3 Gaussian3DGRTShadeMesh(
+    Gaussian3DGRTMeshPayload payload,
+    float3 hitPosition,
+    float3 rayDirection,
+    float incidentIor,
+    float transmittedIor,
+    uint sampleSeed)
+{
+    float3 normal = normalize(payload.meshNormal);
+    float3 viewDirection = normalize(-rayDirection);
+    float noV = saturate(dot(normal, viewDirection));
+    float metallic = saturate(payload.meshMetallic);
+    float nonMetal = 1.0 - metallic;
+    float transmission = saturate(payload.meshTransmission);
+    float dielectricFresnel = Gaussian3DGRTFresnel(
+        noV, incidentIor, transmittedIor);
+
+    float3 diffuse = payload.meshBaseColor *
+        (nonMetal * (1.0 - transmission) *
+         (1.0 - dielectricFresnel) / PI);
+
+    // Lights this material opted out of. Skipping here removes the light's
+    // direct contribution and its shadow ray together, which is what "this
+    // light does not affect this object" has to mean.
+    uint excludeMask = payload.meshPadding[1];
+
+    float3 direct = 0;
+    uint lightCount = min(
+        (uint)max(_Gaussian3DGRTLightCount, 0),
+        (uint)GAUSSIAN_3DGRT_MAX_LIGHTS);
+    [loop]
+    for (uint lightIndex = 0; lightIndex < lightCount; ++lightIndex)
+    {
+        if (Gaussian3DGRTLightExcluded(lightIndex, excludeMask))
+            continue;
+
+        Gaussian3DGRTLightSample light =
+            (Gaussian3DGRTLightSample)0;
+        if (!Gaussian3DGRTSampleLight(
+                lightIndex,
+                hitPosition,
+                light))
+            continue;
+
+        float3 lightDirection = light.direction;
+        float noL = saturate(dot(normal, lightDirection));
+        float noLTransmission = saturate(
+            dot(-normal, lightDirection));
+        if (noL <= 0 &&
+            (noLTransmission <= 0 ||
+             nonMetal * transmission <= 0))
+            continue;
+
+        bool directional =
+            light.type == GAUSSIAN_3DGRT_LIGHT_DIRECTIONAL;
+        const float shadowBias = 0.001;
+        float shadowOffset = directional
+            ? shadowBias
+            : min(shadowBias, light.distance * 0.5);
+        float shadowDistance = directional
+            ? _Gaussian3DGRTMaxRayDistance
+            : max(light.distance - shadowOffset, 1e-5);
+        float3 shadowOrigin =
+            hitPosition + lightDirection * shadowOffset;
+        float gaussianShadow = 1;
+        if (payload.meshShadowStrength > 0)
+        {
+            gaussianShadow = Gaussian3DGRTTraceGaussianShadow(
+                shadowOrigin,
+                lightDirection,
+                shadowDistance,
+                Gaussian3DRTHashCombine(
+                    Gaussian3DRTHashCombine(
+                        sampleSeed,
+                        GAUSSIAN_3DGRT_SEED_MESH_SURFACE_SHADOW),
+                    lightIndex));
+        }
+        float3 meshShadow = Gaussian3DGRTTraceMeshShadow(
+            shadowOrigin,
+            lightDirection,
+            shadowDistance);
+        // Per material, how much of the tool shadow to take; see meshPadding[4].
+        // Skips the trace outright for a material that opts out entirely.
+        float toolShadowReceive =
+            1.0 - saturate(asfloat(payload.meshPadding[4]));
+        // An if, not ?:, which in HLSL evaluates - and so traces - both sides.
+        float toolShadow = 1.0;
+        if (toolShadowReceive > 0)
+        {
+            toolShadow = lerp(
+                1.0,
+                Gaussian3DGRTTraceToolShadow(
+                    shadowOrigin,
+                    lightDirection,
+                    shadowDistance,
+                    lightIndex),
+                toolShadowReceive);
+        }
+        float3 lightVisibility =
+            meshShadow *
+            toolShadow *
+            lerp(1.0, gaussianShadow, payload.meshShadowStrength);
+
+        float3 specular = 0;
+        float3 halfVectorUnnormalized =
+            lightDirection + viewDirection;
+        if (noL > 0 &&
+            dot(
+                halfVectorUnnormalized,
+                halfVectorUnnormalized) > 1e-8)
+        {
+            float3 halfVector = normalize(halfVectorUnnormalized);
+            float noH = saturate(dot(normal, halfVector));
+            float voH = saturate(dot(viewDirection, halfVector));
+            float alpha = max(
+                payload.meshRoughness * payload.meshRoughness,
+                0.0025);
+            float alphaSquared = alpha * alpha;
+            float denominator =
+                noH * noH * (alphaSquared - 1.0) + 1.0;
+            float distribution = alphaSquared /
+                max(PI * denominator * denominator, 1e-5);
+            float geometryK =
+                (payload.meshRoughness + 1.0) *
+                (payload.meshRoughness + 1.0) * 0.125;
+            float geometryV = noV / lerp(noV, 1.0, geometryK);
+            float geometryL = noL / lerp(noL, 1.0, geometryK);
+            float dielectricSpecular = Gaussian3DGRTFresnel(
+                voH, incidentIor, transmittedIor);
+            // NVIDIA's metallic lobe uses base color as its reflection tint.
+            // The dielectric remainder keeps the IOR-derived Fresnel response.
+            float3 specularColor = lerp(
+                dielectricSpecular.xxx,
+                saturate(payload.meshBaseColor),
+                metallic);
+            specular = specularColor * distribution *
+                geometryV * geometryL /
+                max(4.0 * noV * noL, 1e-4);
+        }
+
+        float transmissionFresnel = Gaussian3DGRTFresnel(
+            noLTransmission, incidentIor, transmittedIor);
+        float3 directTransmission =
+            payload.meshBaseColor *
+            nonMetal *
+            transmission *
+            (1.0 - transmissionFresnel) *
+            (noLTransmission / PI);
+        direct +=
+            ((diffuse + specular) * noL + directTransmission) *
+            light.color *
+            lightVisibility;
+    }
+
+    float3 ambient =
+        payload.meshBaseColor *
+        nonMetal *
+        (1.0 - transmission) *
+        _Gaussian3DGRTAmbientColor;
+    return payload.meshEmission + direct + ambient;
+}
+
+float3 Gaussian3DGRTSampleCameraBackground(
+    uint2 sourcePixel,
+    uint2 dimensions,
+    float3 rayOrigin,
+    float3 rayDirection)
+{
+    uint2 samplePixel = sourcePixel;
+    float3 samplePosition =
+        rayOrigin + rayDirection * _Gaussian3DGRTBackgroundProjectionDistance;
+    float4 clipPosition = mul(
+        _GaussianViewProj,
+        float4(samplePosition - _GaussianCameraRelativeOffset, 1));
+
+    if (clipPosition.w > 1e-5)
+    {
+        float2 projectedUv = ComputeNormalizedDeviceCoordinates(
+            samplePosition - _GaussianCameraRelativeOffset,
+            _GaussianViewProj);
+        if (all(projectedUv >= 0) && all(projectedUv <= 1))
+        {
+            samplePixel = min(
+                (uint2)(projectedUv * float2(dimensions)),
+                dimensions - 1);
+        }
+    }
+
+    return _GaussianCameraColor.Load(int4(samplePixel, 0, 0)).rgb;
+}
+
+void Gaussian3DGRTWriteOutput(uint2 pixel, float4 currentSample)
+{
+    if (Gaussian3DGRTUsesStochasticSampling() &&
+        _Gaussian3DGRTFrameSampleId > 0)
+    {
+        float4 previousAverage = _Gaussian3DGRTOutput[pixel];
+        float sampleCount = (float)_Gaussian3DGRTFrameSampleId + 1.0;
+        currentSample = previousAverage +
+            (currentSample - previousAverage) / sampleCount;
+    }
+
+    _Gaussian3DGRTOutput[pixel] = currentSample;
+}
+
+[shader("raygeneration")]
+void RayGenGaussian3DGRT()
+{
+    uint2 pixel = DispatchRaysIndex().xy;
+    uint2 dimensions = DispatchRaysDimensions().xy;
+    uint frameSampleId = (uint)max(_Gaussian3DGRTFrameSampleId, 0);
+    bool stochasticPrimary =
+        _Gaussian3DGRTTraceStrategy ==
+            GAUSSIAN_3DGRT_TRACE_STRATEGY_STOCHASTIC_ANY_HIT;
+    bool stochasticShadows = _Gaussian3DGRTStochasticShadows != 0;
+    bool stochasticSampling = stochasticPrimary || stochasticShadows;
+    uint pixelFrameSeed = 0;
+    if (stochasticSampling)
+    {
+        pixelFrameSeed = Gaussian3DGRTPixelFrameSeed(
+            pixel,
+            dimensions,
+            frameSampleId);
+    }
+    float2 uv = (float2(pixel) + 0.5) / float2(dimensions);
+
+    float3 nearPosition =
+        ComputeWorldSpacePosition(
+            uv, UNITY_NEAR_CLIP_VALUE, _GaussianInvViewProj) +
+        _GaussianCameraRelativeOffset;
+    float3 farPosition =
+        ComputeWorldSpacePosition(
+            uv, UNITY_RAW_FAR_CLIP_VALUE, _GaussianInvViewProj) +
+        _GaussianCameraRelativeOffset;
+
+    RayDesc pathRay;
+    if (_GaussianCameraIsOrthographic != 0)
+    {
+        pathRay.Origin = nearPosition;
+        pathRay.Direction = normalize(farPosition - nearPosition);
+        pathRay.TMin = 0;
+        pathRay.TMax = max(
+            distance(farPosition, nearPosition), 1e-5);
+    }
+    else
+    {
+        pathRay.Origin = _GaussianCameraPosition;
+        pathRay.Direction =
+            normalize(farPosition - pathRay.Origin);
+        pathRay.TMin =
+            distance(nearPosition, pathRay.Origin);
+        pathRay.TMax = max(
+            distance(farPosition, pathRay.Origin),
+            pathRay.TMin + 1e-5);
+    }
+
+    // HDRP opaque geometry is not duplicated into this private RTAS. Its
+    // primary depth still terminates the first segment, exactly as in the
+    // Gaussian-only backend.
+    float primarySegmentMax = pathRay.TMax;
+    float opaqueDepth = _GaussianCameraDepth.Load(int4(pixel, 0, 0));
+    if (opaqueDepth != UNITY_RAW_FAR_CLIP_VALUE)
+    {
+        float3 opaquePosition =
+            ComputeWorldSpacePosition(
+                uv, opaqueDepth, _GaussianInvViewProj) +
+            _GaussianCameraRelativeOffset;
+        float opaqueDistance =
+            dot(opaquePosition - pathRay.Origin, pathRay.Direction);
+        if (opaqueDistance <= pathRay.TMin)
+        {
+            Gaussian3DGRTWriteOutput(pixel, float4(0, 0, 0, 0));
+            return;
+        }
+        primarySegmentMax = min(primarySegmentMax, opaqueDistance);
+    }
+
+    float3 radiance = 0;
+    float3 throughput = 1;
+    bool encounteredRegisteredMesh = false;
+    // A straight-through visualization surface must retain the original HDRP
+    // opaque endpoint. Otherwise its second segment can incorrectly integrate
+    // Gaussians located behind an ordinary opaque mesh.
+    bool preservePrimaryDepthLimit = true;
+    float straightSegmentRemaining = primarySegmentMax;
+
+    float iorStack[GAUSSIAN_3DGRT_MAX_MESH_BOUNCES + 1];
+    iorStack[0] = 1;
+    uint iorStackDepth = 1;
+
+    [loop]
+    for (uint bounce = 0;
+         bounce < GAUSSIAN_3DGRT_MAX_MESH_BOUNCES;
+         ++bounce)
+    {
+        uint segmentSeed = 0;
+        if (stochasticSampling)
+        {
+            segmentSeed = Gaussian3DRTHashCombine(
+                pixelFrameSeed,
+                bounce == 0
+                    ? GAUSSIAN_3DGRT_SEED_PRIMARY_SEGMENT
+                    : GAUSSIAN_3DGRT_SEED_SECONDARY_SEGMENT);
+            segmentSeed = Gaussian3DRTHashCombine(segmentSeed, bounce);
+        }
+
+        float segmentMax = bounce == 0
+            ? primarySegmentMax
+            : (preservePrimaryDepthLimit
+                ? straightSegmentRemaining
+                : _Gaussian3DGRTMaxRayDistance);
+
+        RayDesc meshRay = pathRay;
+        meshRay.TMax = segmentMax;
+        Gaussian3DGRTMeshPayload meshPayload;
+        Gaussian3DGRTTraceClosestMesh(meshRay, meshPayload);
+
+        if (meshPayload.meshHit != 0)
+            segmentMax = min(segmentMax, meshPayload.meshDistance);
+
+        RayDesc gaussianRay = pathRay;
+        gaussianRay.TMax = segmentMax;
+        Gaussian3DGRTSurface gaussianSurface;
+        // Each refracted or reflected segment gets its own sorted K-hit
+        // pass budget, as in
+        // NVIDIA's particle trace call. A dense exterior segment must not
+        // prevent secondary-path Gaussians from tracing.
+        int remainingTracePasses =
+            _Gaussian3DGRTMaxTracePasses;
+        uint gaussianTraceSeed = 0;
+        if (stochasticPrimary)
+        {
+            gaussianTraceSeed = Gaussian3DRTHashCombine(
+                segmentSeed,
+                GAUSSIAN_3DGRT_SEED_GAUSSIAN_TRACE);
+        }
+        Gaussian3DGRTTraceSegment(
+            gaussianRay,
+            remainingTracePasses,
+            gaussianTraceSeed,
+            gaussianSurface);
+
+        if (gaussianSurface.hitCount > 0 &&
+            gaussianSurface.surfaceDistance <
+                GAUSSIAN_3DGRT_INVALID_DISTANCE)
+        {
+            float3 gaussianHitPosition =
+                gaussianRay.Origin +
+                gaussianRay.Direction *
+                    gaussianSurface.surfaceDistance;
+            uint gaussianShadeSeed = 0;
+            if (stochasticShadows)
+            {
+                gaussianShadeSeed = Gaussian3DRTHashCombine(
+                    segmentSeed,
+                    GAUSSIAN_3DGRT_SEED_GAUSSIAN_SHADE);
+            }
+            radiance += throughput *
+                Gaussian3DGRTShadeGaussian(
+                    gaussianSurface,
+                    gaussianHitPosition,
+                    gaussianRay.Direction,
+                    gaussianShadeSeed);
+            throughput *=
+                gaussianSurface.transmittance;
+        }
+
+        if (Gaussian3DGRTMaxComponent(throughput) <=
+            _Gaussian3DGRTMinTransmittance)
+        {
+            throughput = 0;
+            break;
+        }
+
+        if (meshPayload.meshHit == 0)
+        {
+            if (encounteredRegisteredMesh)
+            {
+                radiance += throughput *
+                    Gaussian3DGRTSampleCameraBackground(
+                        pixel,
+                        dimensions,
+                        pathRay.Origin,
+                        pathRay.Direction);
+                throughput = 0;
+            }
+            break;
+        }
+
+        encounteredRegisteredMesh = true;
+        float3 hitPosition =
+            pathRay.Origin +
+            pathRay.Direction * meshPayload.meshDistance;
+        bool frontFace = meshPayload.meshFrontFace != 0;
+
+        if (meshPayload.meshPadding[0] ==
+            GAUSSIAN_3DGRT_MESH_MODE_UNLIT_ALPHA)
+        {
+            // Exact unlit source-over composition. Transmission has its
+            // literal visual meaning here: 0 blocks the background and 1 is
+            // invisible. Keep the ray direction unchanged so no Fresnel,
+            // refraction, lighting, or tint changes that value.
+            float surfaceTransmission =
+                saturate(meshPayload.meshTransmission);
+            float surfaceOpacity = 1.0 - surfaceTransmission;
+            // Tool shadows are the one exception to "no lighting": only
+            // when the material asks for them, and only as a darkening.
+            float unlitToolShadow = surfaceOpacity > 0
+                ? Gaussian3DGRTUnlitToolShadow(meshPayload, hitPosition)
+                : 1;
+            radiance += throughput * surfaceOpacity *
+                max(meshPayload.meshBaseColor, 0) * unlitToolShadow;
+            throughput *= surfaceTransmission;
+
+            if (Gaussian3DGRTMaxComponent(throughput) <=
+                _Gaussian3DGRTMinTransmittance)
+            {
+                throughput = 0;
+                break;
+            }
+
+            float secondaryBias = clamp(
+                meshPayload.meshDistance * 1e-4,
+                1e-5,
+                5e-4);
+            straightSegmentRemaining = max(
+                straightSegmentRemaining -
+                    meshPayload.meshDistance - secondaryBias,
+                0);
+            pathRay.Origin =
+                hitPosition + pathRay.Direction * secondaryBias;
+            pathRay.TMin = 0;
+            pathRay.TMax = straightSegmentRemaining;
+
+            if (bounce >= meshPayload.meshMaxBounces ||
+                straightSegmentRemaining <= 1e-5)
+                break;
+            continue;
+        }
+
+        // Physical reflection/refraction no longer follows the primary camera
+        // ray, so the screen-space opaque endpoint cannot constrain it.
+        preservePrimaryDepthLimit = false;
+
+        float incidentIor;
+        float transmittedIor;
+        if (frontFace)
+        {
+            incidentIor = iorStack[iorStackDepth - 1];
+            transmittedIor = meshPayload.meshIor;
+        }
+        else
+        {
+            incidentIor = iorStackDepth > 1
+                ? iorStack[iorStackDepth - 1]
+                : meshPayload.meshIor;
+            transmittedIor = iorStackDepth > 1
+                ? iorStack[iorStackDepth - 2]
+                : 1.0;
+        }
+
+        uint meshShadeSeed = 0;
+        if (stochasticShadows)
+        {
+            meshShadeSeed = Gaussian3DRTHashCombine(
+                segmentSeed,
+                GAUSSIAN_3DGRT_SEED_MESH_SHADE);
+        }
+        radiance += throughput * Gaussian3DGRTShadeMesh(
+            meshPayload,
+            hitPosition,
+            pathRay.Direction,
+            incidentIor,
+            transmittedIor,
+            meshShadeSeed);
+
+        float3 meshNormal = normalize(meshPayload.meshNormal);
+        float noV = saturate(dot(meshNormal, -pathRay.Direction));
+        float fresnel = Gaussian3DGRTFresnel(
+            noV, incidentIor, transmittedIor);
+        float metallic = saturate(meshPayload.meshMetallic);
+        float nonMetal = 1.0 - metallic;
+        float3 reflectedDirection = normalize(reflect(
+            pathRay.Direction, meshNormal));
+        float3 nextDirection;
+
+        // In the smooth full-metal limit NVIDIA's sampled GGX lobe becomes
+        // reflect(ray, normal) with base color as throughput. Opaque partial
+        // metallic values are deterministically split: the metal contribution
+        // follows the real reflected ray, while the remaining dielectric
+        // Fresnel contribution retains the screen-space approximation.
+        bool traceMetalReflection =
+            metallic > 1e-4 &&
+            (meshPayload.meshTransmission <= 1e-4 ||
+             nonMetal <= 1e-4);
+        if (traceMetalReflection)
+        {
+            float dielectricReflectionWeight = nonMetal * fresnel;
+            if (dielectricReflectionWeight > 1e-4)
+            {
+                radiance += throughput *
+                    dielectricReflectionWeight *
+                    Gaussian3DGRTSampleCameraBackground(
+                        pixel,
+                        dimensions,
+                        hitPosition,
+                        reflectedDirection);
+            }
+
+            // Match Vulkan's bounce < material.maxBounces continuation gate.
+            // Max Bounces = 1 therefore permits one reflected segment.
+            if (bounce >= meshPayload.meshMaxBounces)
+            {
+                throughput = 0;
+                break;
+            }
+
+            throughput *=
+                metallic * saturate(meshPayload.meshBaseColor);
+            if (Gaussian3DGRTMaxComponent(throughput) <=
+                _Gaussian3DGRTMinTransmittance)
+            {
+                throughput = 0;
+                break;
+            }
+            nextDirection = reflectedDirection;
+        }
+        else
+        {
+            nextDirection = refract(
+                pathRay.Direction,
+                meshNormal,
+                incidentIor / max(transmittedIor, 1e-5));
+            bool totalInternalReflection =
+                dot(nextDirection, nextDirection) <= 1e-8;
+            float effectiveTransmission =
+                nonMetal * saturate(meshPayload.meshTransmission);
+
+            if (totalInternalReflection)
+            {
+                if (bounce >= meshPayload.meshMaxBounces ||
+                    effectiveTransmission <= 1e-4)
+                {
+                    throughput = 0;
+                    break;
+                }
+                nextDirection = reflectedDirection;
+            }
+            else
+            {
+                // Mixed metallic/transmission materials need multiple BSDF
+                // paths. Until temporal stochastic sampling is available,
+                // keep their reflected contribution screen-space and continue
+                // the non-metallic transmitted contribution.
+                float3 screenReflectionWeight =
+                    nonMetal * fresnel +
+                    metallic * saturate(meshPayload.meshBaseColor);
+                radiance += throughput * screenReflectionWeight *
+                    Gaussian3DGRTSampleCameraBackground(
+                        pixel,
+                        dimensions,
+                        hitPosition,
+                        reflectedDirection);
+
+                if (bounce >= meshPayload.meshMaxBounces ||
+                    effectiveTransmission <= 1e-4)
+                {
+                    throughput = 0;
+                    break;
+                }
+
+                // One square-root tint per interface gives approximately the
+                // material color after crossing a closed two-interface shell.
+                float3 interfaceTint = sqrt(saturate(
+                    meshPayload.meshBaseColor));
+                throughput *=
+                    effectiveTransmission *
+                    (1.0 - fresnel) *
+                    interfaceTint;
+
+                if (frontFace)
+                {
+                    if (iorStackDepth <
+                        GAUSSIAN_3DGRT_MAX_MESH_BOUNCES + 1)
+                    {
+                        iorStack[iorStackDepth] = transmittedIor;
+                        ++iorStackDepth;
+                    }
+                }
+                else if (iorStackDepth > 1)
+                {
+                    --iorStackDepth;
+                }
+            }
+        }
+
+        nextDirection = normalize(nextDirection);
+        const float secondaryBias = 0.0005;
+        pathRay.Origin =
+            hitPosition + nextDirection * secondaryBias;
+        pathRay.Direction = nextDirection;
+        pathRay.TMin = 0;
+        pathRay.TMax = _Gaussian3DGRTMaxRayDistance;
+    }
+
+    if (encounteredRegisteredMesh &&
+        Gaussian3DGRTMaxComponent(throughput) >
+            _Gaussian3DGRTMinTransmittance)
+    {
+        radiance += throughput *
+            Gaussian3DGRTSampleCameraBackground(
+                pixel,
+                dimensions,
+                pathRay.Origin,
+                pathRay.Direction);
+    }
+
+    if (encounteredRegisteredMesh)
+    {
+        // This path already includes its secondary HDRP background, so it
+        // replaces the camera pixel during premultiplied composition.
+        Gaussian3DGRTWriteOutput(pixel, float4(radiance, 1));
+    }
+    else
+    {
+        Gaussian3DGRTWriteOutput(pixel, float4(
+            radiance,
+            saturate(1.0 - throughput.x)));
+    }
+}

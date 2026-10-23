@@ -1,0 +1,79 @@
+// SPDX-License-Identifier: MIT
+
+#pragma kernel CSClearHeads
+#pragma kernel CSResolve
+#pragma require compute
+#pragma use_dxc
+
+struct GaussianPPLLNode
+{
+    float4 color;
+    float depth;
+    uint next;
+};
+
+RWTexture2D<uint> _GaussianPPLLHeads;
+RWStructuredBuffer<GaussianPPLLNode> _GaussianPPLLNodes;
+RWTexture2D<float4> _GaussianPPLLResult;
+
+float4 _GaussianPPLLDimensions;
+uint _GaussianPPLLMaxResolveFragments;
+
+#define GAUSSIAN_PPLL_EMPTY 0xFFFFFFFFu
+#define GAUSSIAN_PPLL_LOCAL_MAX 64
+
+[numthreads(8, 8, 1)]
+void CSClearHeads(uint3 id : SV_DispatchThreadID)
+{
+    uint2 pixel = id.xy;
+    if (pixel.x >= (uint)_GaussianPPLLDimensions.x || pixel.y >= (uint)_GaussianPPLLDimensions.y)
+        return;
+
+    _GaussianPPLLHeads[pixel] = GAUSSIAN_PPLL_EMPTY;
+    _GaussianPPLLResult[pixel] = 0.0;
+}
+
+[numthreads(8, 8, 1)]
+void CSResolve(uint3 id : SV_DispatchThreadID)
+{
+    uint2 pixel = id.xy;
+    if (pixel.x >= (uint)_GaussianPPLLDimensions.x || pixel.y >= (uint)_GaussianPPLLDimensions.y)
+        return;
+
+    GaussianPPLLNode fragments[GAUSSIAN_PPLL_LOCAL_MAX];
+    uint count = 0;
+    uint nodeIndex = _GaussianPPLLHeads[pixel];
+    uint maxFragments = min(_GaussianPPLLMaxResolveFragments, GAUSSIAN_PPLL_LOCAL_MAX);
+
+    while (nodeIndex != GAUSSIAN_PPLL_EMPTY && count < maxFragments)
+    {
+        GaussianPPLLNode node = _GaussianPPLLNodes[nodeIndex];
+        fragments[count] = node;
+        count++;
+        nodeIndex = node.next;
+    }
+
+    for (uint i = 1; i < count; i++)
+    {
+        GaussianPPLLNode item = fragments[i];
+        int j = (int)i - 1;
+        while (j >= 0 && fragments[j].depth < item.depth)
+        {
+            fragments[j + 1] = fragments[j];
+            j--;
+        }
+        fragments[j + 1] = item;
+    }
+
+    float4 outColor = 0.0;
+    for (uint i = 0; i < count; i++)
+    {
+        float4 src = fragments[i].color;
+        src.a = saturate(src.a);
+        src.rgb *= src.a;
+        outColor.rgb = src.rgb + outColor.rgb * (1.0 - src.a);
+        outColor.a = src.a + outColor.a * (1.0 - src.a);
+    }
+
+    _GaussianPPLLResult[pixel] = outColor;
+}

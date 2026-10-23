@@ -1,0 +1,12 @@
+.DS_Store
+Thumbs.db
+.vs/
+.idea/
+.verification~/
+*.csproj
+!Tools~/PlyImportTests.csproj
+*.sln
+*.user
+*.tgz
+Tools~/bin/
+Tools~/obj/

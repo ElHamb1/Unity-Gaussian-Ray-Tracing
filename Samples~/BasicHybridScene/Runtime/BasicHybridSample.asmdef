@@ -1,0 +1,6 @@
+{
+  "name": "GaussianRayTracing.BasicHybridSample",
+  "rootNamespace": "GaussianSplatting.Samples",
+  "references": ["GaussianSplatting"],
+  "autoReferenced": true
+}

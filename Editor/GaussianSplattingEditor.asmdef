@@ -1,0 +1,17 @@
+{
+  "name": "GaussianSplattingEditor",
+  "rootNamespace": "GaussianSplatting.Editor",
+  "references": [
+    "GaussianSplatting",
+    "Unity.Mathematics",
+    "Unity.Burst",
+    "Unity.Collections",
+    "Unity.RenderPipelines.Core.Runtime",
+    "Unity.RenderPipelines.HighDefinition.Runtime"
+  ],
+  "allowUnsafeCode": true,
+  "autoReferenced": true,
+  "includePlatforms": [
+    "Editor"
+  ]
+}
