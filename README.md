@@ -11,7 +11,8 @@ Package: `com.markus.gaussian-raytracing` version `0.1.0`.
 ## Demo
 
 https://github.com/user-attachments/assets/7d90bd6d-1e21-4c1b-8711-3cf37f3f9413
-Demo: Gaussian ray tracing in Unity HDRP with dynamic shadows, dynamic light and transparent meshes.
+
+*Demo: Gaussian ray tracing in Unity HDRP with dynamic shadows, dynamic light and transparent meshes.*
 
 **Model credit:** [“3D gaussian model of a bouquet of flowers”](https://developer.download.nvidia.com/ProGraphics/nvpro-samples/flowers_1.zip)
 by [Jean-Eudes Marvie](https://jmarvie.com), distributed via NVIDIA.
